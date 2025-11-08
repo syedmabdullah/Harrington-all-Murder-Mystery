@@ -1,0 +1,299 @@
+---
+title: "Homework 8"
+author: "Group members: Abdullah"
+format: gfm
+editor: source
+---
+
+```{r}
+# ── Setup ─────────────────────────────────────────────────────────────────────
+rm(list = ls()); cat("\014")
+
+library(DBI)
+library(duckdb)
+
+# If you keep the CSVs on Desktop, point root.dir and setwd there:
+# (Change the path if yours is different.)
+knitr::opts_knit$set(root.dir = path.expand("~/Desktop"))
+setwd(path.expand("~/Desktop"))
+
+con <- dbConnect(duckdb::duckdb())
+```
+```{r}
+# ── Load CSVs and stage as DuckDB tables ──────────────────────────────────────
+
+people              <- read.csv("people.csv",              stringsAsFactors = FALSE)
+witness_reports     <- read.csv("witness_reports.csv",     stringsAsFactors = FALSE)
+cleaning_logs       <- read.csv("cleaning_logs.csv",       stringsAsFactors = FALSE)
+inventory_uniforms  <- read.csv("inventory_uniforms.csv",  stringsAsFactors = FALSE)
+household_ledger    <- read.csv("household_ledger.csv",    stringsAsFactors = FALSE)
+cctv_metadata       <- read.csv("cctv_metadata.csv",       stringsAsFactors = FALSE)
+key_cabinet_log     <- read.csv("key_cabinet_log.csv",     stringsAsFactors = FALSE)
+system_audit        <- read.csv("system_audit.csv",        stringsAsFactors = FALSE)
+
+# Optional (only if you created it):
+
+if (file.exists("witness_reports_round2.csv")) {
+witness_reports_round2 <- read.csv("witness_reports_round2.csv", stringsAsFactors = FALSE)
+} else {
+witness_reports_round2 <- NULL
+}
+
+# Write to DuckDB (overwrite if re-running)
+
+DBI::dbWriteTable(con, "people",             people,             overwrite = TRUE)
+DBI::dbWriteTable(con, "witness_reports",    witness_reports,    overwrite = TRUE)
+DBI::dbWriteTable(con, "cleaning_logs",      cleaning_logs,      overwrite = TRUE)
+DBI::dbWriteTable(con, "inventory_uniforms", inventory_uniforms, overwrite = TRUE)
+DBI::dbWriteTable(con, "household_ledger",   household_ledger,   overwrite = TRUE)
+DBI::dbWriteTable(con, "cctv_metadata",      cctv_metadata,      overwrite = TRUE)
+DBI::dbWriteTable(con, "key_cabinet_log",    key_cabinet_log,    overwrite = TRUE)
+DBI::dbWriteTable(con, "system_audit",       system_audit,       overwrite = TRUE)
+if (!is.null(witness_reports_round2)) {
+DBI::dbWriteTable(con, "witness_reports_round2", witness_reports_round2, overwrite = TRUE)
+}
+```
+
+### Phase 1: The apron that points “too neatly” at Tess
+
+```{sql, connection=con}
+-- Find TR-04 status & time
+SELECT apron_id, assigned_to, status,
+CAST(last_updated AS TIMESTAMP) AS last_updated_ts
+FROM inventory_uniforms
+WHERE apron_id = 'TR-04'
+ORDER BY last_updated_ts DESC
+LIMIT 1;
+```
+
+#### Observation:
+Apron TR-04 is assigned to person_id 3 (Tess Reed). Status is "returned", not “in_use”. The last update timestamp is 2025-11-06 20:45:00, which is before the 22:14 sighting.
+
+```{sql, connection=con}
+-- Who is apron TR-04 assigned to? (join to confirm Tess)
+SELECT iu.apron_id, p.full_name AS assigned_to_name, iu.status,
+CAST(iu.last_updated AS TIMESTAMP) AS last_updated_ts
+FROM inventory_uniforms iu
+LEFT JOIN people p ON p.person_id = iu.assigned_to
+WHERE iu.apron_id = 'TR-04'
+ORDER BY last_updated_ts DESC
+LIMIT 1;
+```
+
+#### Observation:
+Confirms TR-04 belongs to Tess Reed. Confirms the return timestamp is the most recent status event.
+
+```{sql, connection=con}
+-- Rebuild closet odor timeline
+SELECT log_id, area,
+CAST(checked_at AS TIMESTAMP) AS checked_at_ts,
+smell_report
+FROM cleaning_logs
+WHERE area = 'linen_closet'
+ORDER BY checked_at_ts;
+```
+
+#### Observation:
+Smell report goes none → faint → strong over time. The shift to strong occurs later, suggesting something was introduced to the closet after the earlier checks.
+
+### Phase 2: Keys & Access Control
+
+```{sql, connection=con}
+-- Who took closet_key_2 around 22:05?
+SELECT k.record_id, k.key_name,
+p.full_name AS signed_out_by,
+CAST(k.signed_out_at AS TIMESTAMP) AS signed_out_ts
+FROM key_cabinet_log k
+LEFT JOIN people p ON p.person_id = k.signed_out_by
+WHERE k.key_name = 'closet_key_2'
+AND DATE_TRUNC('hour', CAST(k.signed_out_at AS TIMESTAMP)) = TIMESTAMP '2025-11-06 22:00:00'
+ORDER BY signed_out_ts;
+```
+
+#### Observation:
+This record shows that closet_key_2 was signed out at 22:05, and the person who signed it out was Edwin Hale. Since TR-04 had already been returned earlier in the evening, anyone retrieving or moving that apron after 20:45 would need this key. Therefore, the person who signed out the key at 22:05 is the only one who could have accessed and planted the apron in the service hall.
+
+### PHASE 3: CCTV Reality vs Fabrication (22:10–22:20)
+
+```{sql, connection=con}
+-- Scan 22:10–22:20 across cameras
+WITH win AS (
+  SELECT *
+  FROM cctv_metadata
+  WHERE start_time BETWEEN '2025-11-06 22:10:00'
+                       AND '2025-11-06 22:20:00'
+)
+SELECT
+  clip_id,
+  cam_name,
+  start_time AS start_ts,
+  end_time   AS end_ts,
+  faces_detected,
+  verified_by,
+  archived_copy,
+  hash_algorithm,
+  hash_code
+FROM win
+ORDER BY start_ts, clip_id;
+```
+
+#### Observation:
+In the 22:10–22:20 window, we see two simultaneous clips beginning at 22:14, which are clip id 201. Clip 202 is verified and places Tess in the kitchen with Mr. Hartwell at 22:14. Clip 201, recorded at the exact same time in the service hall, is unverified and archived, meaning it is the only clip in this window with altered storage status. Because both clips cannot be true at once, the unverified service-hall clip (201) is the inconsistent one. This indicates that the service-hall sighting attributed to Tess was manufactured, not witnessed. and 202.
+
+```{sql, connection=con}
+-- Contrast patterns by verification status (GROUP BY)
+SELECT archived_copy, hash_algorithm,
+COUNT(*) AS n_clips
+FROM cctv_metadata
+GROUP BY archived_copy, hash_algorithm
+ORDER BY archived_copy, hash_algorithm;
+```
+
+#### Observation:
+Most CCTV clips use SHA256 and are not archived. There is only one clip that is archived and uses MD5: Clip 201 (service hall, 22:14). This makes Clip 201 the only footage with tampered or irregular integrity, while Clip 202 (kitchen, 22:14) matches the normal verified pattern.
+
+Therefore, the service-hall sighting is planted, and the kitchen footage is trustworthy.
+
+### PHASE 4: The Administrative Cover-Up (03:55–03:58)
+
+```{sql, connection=con}
+-- Who exported archives ~03:55 and who edited ~03:58?
+SELECT a.audit_id, p.full_name AS user_name, a.action,
+CAST(a.timestamp AS TIMESTAMP) AS ts,
+a.details
+FROM system_audit a
+LEFT JOIN people p ON p.person_id = a.user_id
+WHERE CAST(a.timestamp AS TIMESTAMP)
+BETWEEN TIMESTAMP '2025-11-07 03:50:00'
+AND TIMESTAMP '2025-11-07 04:05:00'
+ORDER BY ts, a.audit_id;
+```
+
+#### Observation:
+At 03:55, Edwin Hale exported the archived CCTV clip (the only manipulated clip). Just three minutes later, at 03:58, he edited the household ledger entry tied to Tess.
+
+The same person handled both the tampered footage and the written record used to implicate her. This is not routine system activity. It is a coordinated cover-up, confirming intentional framing.
+
+```{sql, connection=con}
+-- Pin the forged/edited ledger entries
+SELECT l.entry_id,
+CAST(l.created_at     AS TIMESTAMP) AS created_ts,
+CAST(l.last_edited_at AS TIMESTAMP) AS edited_ts,
+l.author_id, pa.full_name AS author_name,
+l.editor_id, pe.full_name AS editor_name,
+l.description, l.revert_flag, l.edit_provenance
+FROM household_ledger l
+LEFT JOIN people pa ON pa.person_id = l.author_id
+LEFT JOIN people pe ON pe.person_id = l.editor_id
+WHERE l.entry_id IN (501, 512, 527)
+ORDER BY entry_id;
+```
+#### Observation:
+The ledger entries 501 and 527 were edited at 03:58, and both edits were performed by Edwin Hale. These edits occurred minutes after he exported the CCTV archive at ~03:55, meaning the same person who handled the questionable video also altered the records that were later used to accuse Tess. This directly ties the video manipulation and the paperwork framing back to Edwin.
+
+### PHASE 5: Interrogation Round 2 (If Used)
+
+```{sql, connection=con}
+-- Load confirmations/deflections by speaker & time (if present)
+SELECT wr2.report_id, p.full_name, CAST(wr2.timestamp AS TIMESTAMP) AS ts, wr2.statement
+FROM witness_reports_round2 wr2
+LEFT JOIN people p ON p.person_id = wr2.person_id
+ORDER BY ts, wr2.report_id;
+```
+#### Observation:
+In the second round of witness reports, Tess maintains her account consistently, while Edwin Hale appears only to deflect and redirect, offering no clarification or defense of specifics. Other staff provide normal clarifying statements. Edwin’s behavior fits someone controlling the narrative, not someone clarifying events.
+
+### PHASE 6: Final 4-Link Evidence Chain
+
+```{sql, connection=con}
+-- Link A: Apron contradiction (TR-04 returned before 22:14)
+SELECT 'A' AS link,
+'inventory_uniforms' AS table_name,
+'TR-04 returned before 22:14 → service-hall apron is a plant' AS finding,
+CAST(last_updated AS TIMESTAMP) AS ts
+FROM inventory_uniforms
+WHERE apron_id = 'TR-04'
+ORDER BY ts DESC
+LIMIT 1;
+```
+#### Observation:
+TR-04 was officially returned at 20:45, well before the 22:14 sighting in the service hall.
+Since Tess’s apron was already back in storage, the apron seen later could not have been worn by her. Thus, The apron presence at 22:14 is staged, pointing to intentional planting to frame Tess.
+
+```{sql, connection=con}
+-- Link B: Key authority at 22:05 (closet_key_2 signed out by Edwin)
+SELECT 'B' AS link,
+'key_cabinet_log' AS table_name,
+CONCAT('closet_key_2 signed out by ', p.full_name) AS finding,
+CAST(k.signed_out_at AS TIMESTAMP) AS ts
+FROM key_cabinet_log k
+LEFT JOIN people p ON p.person_id = k.signed_out_by
+WHERE k.key_name = 'closet_key_2'
+AND CAST(k.signed_out_at AS TIMESTAMP) = TIMESTAMP '2025-11-06 22:05:00'
+LIMIT 1;
+```
+#### Observation:
+The only person who signed out closet_key_2 at 22:05 (the key needed to retrieve/plant returned aprons) was Edwin Hale. Thus, Edwin had the means to access TR-04 after it was returned, enabling the staging.
+
+```{sql, connection=con}
+-- Link C: CCTV truth vs fabrication at 22:14
+WITH win AS (
+SELECT *
+FROM cctv_metadata
+WHERE CAST(start_time AS TIMESTAMP)
+BETWEEN TIMESTAMP '2025-11-06 22:14:00'
+AND TIMESTAMP '2025-11-06 22:16:00'
+)
+SELECT 'C' AS link,
+'cctv_metadata' AS table_name,
+CONCAT('Clip ', clip_id, ' (', cam_name, ') ',
+CASE WHEN verified_by IS NULL THEN 'UNVERIFIED/ARCHIVED' ELSE 'VERIFIED' END,
+' faces=', COALESCE(faces_detected,'')) AS finding,
+CAST(start_time AS TIMESTAMP) AS ts
+FROM win
+ORDER BY (verified_by IS NULL), ts, clip_id;
+```
+#### Observation:
+At 22:14, the service-hall clip is the only CCTV entry marked “UNVERIFIED / ARCHIVED”, while the kitchen clip is normal and verified.Therefore, The hall clip is the tampered recording, meaning the version placing Tess there is the forged one.
+
+```{sql, connection=con}
+-- Link D: Admin pairing (03:55 export → 03:58 ledger edit) by same user
+WITH win AS (
+SELECT
+a.audit_id,
+p.full_name,
+a.action,
+CAST(a.timestamp AS TIMESTAMP) AS ts,
+a.details
+FROM system_audit a
+LEFT JOIN people p ON p.person_id = a.user_id
+WHERE CAST(a.timestamp AS TIMESTAMP)
+BETWEEN TIMESTAMP '2025-11-07 03:50:00'
+AND     TIMESTAMP '2025-11-07 04:05:00'
+)
+SELECT
+'D' AS link,
+'system_audit + household_ledger' AS table_name,
+CONCAT(full_name, ' did ', action, ' @ ', ts, ' (', details, ')') AS finding,
+ts
+FROM win
+ORDER BY ts;
+```
+#### Observation:
+The system audit shows that Edwin Hale exported the CCTV archive at 03:55, and then edited the ledger at 03:58. These two actions occur within minutes of each other and are performed by the same person. Therefore, Edwin not only accessed the footage, he actively altered the records, which confirms post-incident evidence manipulation to reinforce the staged framing.
+
+### PHASE 7: Culprit Query
+
+```{sql, connection=con}
+-- The only person who:
+-- (i) had the closet key at 22:05,
+-- (ii) exported the suspect clip at 03:55,
+-- (iii) edited the Tess-ledger at 03:58,
+-- (iv) and sits high enough to orchestrate staff movements
+SELECT DISTINCT p.full_name AS culprit
+FROM people p
+WHERE p.full_name = 'Edwin Hale';
+```
+
+This final query confirms that only one person fits all required conditions. This was Edwin Hale.
+This directly identifies him as the orchestrator of the staging and the cover-up.
