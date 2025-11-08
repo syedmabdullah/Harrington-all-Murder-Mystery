@@ -1,4 +1,4 @@
-# Harrington-all-Murder-Mystery
+# Harrington Hall Murder Mystery
 
 A fully playable, evidence-based SQL murder mystery that guides players through a structured investigation.
 Each phase unlocks new datasets, encouraging deductive reasoning, timeline construction, and critical source evaluation.
